@@ -130,7 +130,7 @@ app.use((req, res, next) => {
   // GitHub Pages origin + local test pages. Tighten this allow-list at deploy.
   res.setHeader('Access-Control-Allow-Origin', process.env.CORS_ORIGIN || FRONTEND_URL);
   res.setHeader('Access-Control-Allow-Headers', 'content-type');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,POST,DELETE,OPTIONS');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
@@ -398,6 +398,14 @@ app.get('/api/listings/:id', (req, res) => {
 // fuelType/bodyType, and local-only fields (password, car photo,
 // agreement) that are NOT sent to / stored by this endpoint. The listing
 // stores cents (pricePerDayCents), matching the existing listing shape.
+//
+// TEST LISTINGS: testListing is an explicit boolean in the request body
+// ONLY (b.testListing === true). The app shim sets it when the host's
+// description is marked "TEST LISTING ONLY" — that is the only way an
+// app-created listing gets the flag, so a genuine host listing is never
+// marked test by default. The flag only drives the TEST banner on
+// book.html; it never affects money. (The seed Camry has testListing:
+// true in the data file for the same reason.)
 function newListingId(listings) {
   let id;
   do {
@@ -513,7 +521,9 @@ app.post('/api/listings', (req, res) => {
     minTripDays,
     maxTripDays,
     blockedDates,
-    testListing: false,
+    // Explicit flag only — see the comment above POST /api/listings.
+    // Never derived from free text on the server, never defaulted true.
+    testListing: b.testListing === true,
   };
   listings.push(listing);
   saveListings(listings);
@@ -521,6 +531,50 @@ app.post('/api/listings', (req, res) => {
   // Never leak a host's Connect account id to the browser.
   const { hostStripeAccountId: _acct, ...pub } = listing;
   res.status(201).json({ ok: true, listing: { ...pub, payoutsReady: Boolean(hostStripeAccountId) } });
+});
+
+// ---------------------------------------------------------------------------
+// DELETE /api/listings/:id — a host removes ONLY their own listing.
+// ---------------------------------------------------------------------------
+// Ownership is checked against the listing's hostEmail (the requester
+// sends their signed-in host email; anyone else gets 403). SAFE DEFAULT
+// ON BOOKINGS: delete is refused (409) while any booking for the car is
+// still live — status 'paid' or 'awaiting_payment' with an endDate of
+// today or later. Deleting under a live booking would orphan a trip a
+// renter already paid for (the webhook would find no listing and the
+// transfer would fail with the money sitting on the platform). A trip
+// whose endDate has passed does NOT block delete — the money is settled
+// and the listing is just history. A future pass could add a proper
+// cancel flow instead of blocking on live bookings.
+app.delete('/api/listings/:id', (req, res) => {
+  const id = req.params.id;
+  const hostEmail = String(
+    (req.body && (req.body.hostEmail || req.body.email)) || req.query.hostEmail || ''
+  ).trim().toLowerCase();
+  if (!hostEmail || !/^\S+@\S+\.\S+$/.test(hostEmail)) {
+    return res.status(400).json({ ok: false, error: 'A valid host email is required.' });
+  }
+  const listings = loadListings();
+  const listing = listings.find((l) => l.id === id);
+  if (!listing) return res.status(404).json({ ok: false, error: 'Listing not found.' });
+  if (String(listing.hostEmail || '').toLowerCase() !== hostEmail) {
+    return res.status(403).json({ ok: false, error: 'You can only remove your own listing.' });
+  }
+  const today = new Date().toISOString().slice(0, 10);
+  const liveBooking = loadBookings().find(
+    (b) =>
+      b.listingId === id &&
+      (b.status === 'paid' || b.status === 'awaiting_payment') &&
+      String(b.endDate || '') >= today
+  );
+  if (liveBooking) {
+    return res.status(409).json({
+      ok: false,
+      error: 'This car has a live booking — it cannot be removed until that trip is over. Email info@graycodeenterprise.net to cancel it.',
+    });
+  }
+  saveListings(listings.filter((l) => l.id !== id));
+  res.json({ ok: true, deletedId: id });
 });
 
 // Look up a Checkout Session after the renter returns from Stripe, so the
